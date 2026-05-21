@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   useMemo,
+  memo,
 } from 'react'
 import {
   ReactFlow,
@@ -21,10 +22,15 @@ import {
   useNodes,
   ReactFlowProvider,
   Panel,
+  useViewport,
+  SelectionMode,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { motion, AnimatePresence, useAnimation } from 'framer-motion'
+import { motion, AnimatePresence, useAnimation, useSpring, useTransform } from 'framer-motion'
 import Tilt from 'react-parallax-tilt'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
+import { Float, Stars, EffectComposer, ChromaticAberration, DepthOfField } from '@react-three/drei'
+import * as THREE from 'three'
 
 export type AgentStatus = 'executing' | 'listening' | 'idle' | 'error'
 
@@ -61,175 +67,275 @@ const statusBg: Record<AgentStatus, string> = {
   error: 'rgba(239,68,68,0.15)',
 }
 
-// ─── Three.js animated background ───────────────────────────────────────────
-function ThreeBackground({ mouseX, mouseY }: { mouseX: number; mouseY: number }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const animRef = useRef<number>(0)
+// ─── Ambient Sound Engine ─────────────────────────────────────────────────────
+class AmbientSoundEngine {
+  private audioCtx: AudioContext | null = null
+  private oscillators: OscillatorNode[] = []
+  private gainNodes: GainNode[] = []
+  private masterGain: GainNode | null = null
+  private isPlaying = false
+
+  init() {
+    if (this.audioCtx) return
+    this.audioCtx = new AudioContext()
+    this.masterGain = this.audioCtx.createGain()
+    this.masterGain.gain.value = 0
+    this.masterGain.connect(this.audioCtx.destination)
+
+    // Create layered oscillators for ambient synth hum
+    const frequencies = [55, 82.5, 110, 165] // A1, E2, A2, E3 - power chord
+    frequencies.forEach((freq, i) => {
+      const osc = this.audioCtx!.createOscillator()
+      const gain = this.audioCtx!.createGain()
+      osc.type = i === 0 ? 'sawtooth' : 'sine'
+      osc.frequency.value = freq
+      gain.gain.value = i === 0 ? 0.15 : 0.08 / (i + 1)
+      osc.connect(gain)
+      gain.connect(this.masterGain!)
+      osc.start()
+      this.oscillators.push(osc)
+      this.gainNodes.push(gain)
+    })
+  }
+
+  toggle() {
+    if (!this.audioCtx) this.init()
+    if (this.isPlaying) {
+      this.masterGain?.gain.linearRampToValueAtTime(0, this.audioCtx!.currentTime + 0.5)
+    } else {
+      this.audioCtx?.resume()
+      this.masterGain?.gain.linearRampToValueAtTime(0.3, this.audioCtx!.currentTime + 0.5)
+    }
+    this.isPlaying = !this.isPlaying
+    return this.isPlaying
+  }
+
+  setIntensity(activeCount: number) {
+    if (!this.isPlaying || !this.audioCtx) return
+    // Modulate pitch based on active agents
+    const pitchMod = 1 + activeCount * 0.02
+    this.oscillators.forEach((osc, i) => {
+      const baseFreq = [55, 82.5, 110, 165][i]
+      osc.frequency.linearRampToValueAtTime(baseFreq * pitchMod, this.audioCtx!.currentTime + 0.1)
+    })
+  }
+
+  destroy() {
+    this.oscillators.forEach(osc => osc.stop())
+    this.audioCtx?.close()
+  }
+}
+
+const soundEngine = typeof window !== 'undefined' ? new AmbientSoundEngine() : null
+
+// ─── 3D Floating Geometry that morphs ─────────────────────────────────────────
+function MorphingGeometry({ position, mouseX, mouseY }: { position: [number, number, number]; mouseX: number; mouseY: number }) {
+  const meshRef = useRef<THREE.Mesh>(null)
+  const [geoType, setGeoType] = useState(0)
   const timeRef = useRef(0)
 
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    const interval = setInterval(() => {
+      setGeoType(g => (g + 1) % 3)
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [])
 
-    let width = canvas.offsetWidth
-    let height = canvas.offsetHeight
-    canvas.width = width
-    canvas.height = height
-
-    const resize = () => {
-      width = canvas.offsetWidth
-      height = canvas.offsetHeight
-      canvas.width = width
-      canvas.height = height
-    }
-    window.addEventListener('resize', resize)
-
-    // Particles
-    const particles: { x: number; y: number; vx: number; vy: number; size: number; alpha: number }[] = []
-    for (let i = 0; i < 200; i++) {
-      particles.push({
-        x: Math.random() * width,
-        y: Math.random() * height,
-        vx: (Math.random() - 0.5) * 0.25,
-        vy: (Math.random() - 0.5) * 0.25,
-        size: Math.random() * 1.5 + 0.3,
-        alpha: Math.random() * 0.5 + 0.15,
-      })
-    }
-
-    // Floating geometry vertices (icosahedron-like 3D projected)
-    const geos: { cx: number; cy: number; r: number; rot: number; rotSpeed: number; alpha: number; sides: number }[] = []
-    for (let i = 0; i < 6; i++) {
-      geos.push({
-        cx: Math.random() * width,
-        cy: Math.random() * height,
-        r: 30 + Math.random() * 60,
-        rot: Math.random() * Math.PI * 2,
-        rotSpeed: (Math.random() - 0.5) * 0.003,
-        alpha: 0.04 + Math.random() * 0.06,
-        sides: [3, 4, 5, 6, 8][Math.floor(Math.random() * 5)],
-      })
-    }
-
-    const draw = () => {
-      timeRef.current += 0.008
-      const t = timeRef.current
-
-      ctx.clearRect(0, 0, width, height)
-
-      // Parallax grid – layer 1 (slowest)
-      const mx = mouseX * 0.02
-      const my = mouseY * 0.02
-      const gridSize = 60
-      ctx.strokeStyle = 'rgba(139,92,246,0.07)'
-      ctx.lineWidth = 0.5
-      for (let x = (mx % gridSize) - gridSize; x < width + gridSize; x += gridSize) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke()
-      }
-      for (let y = (my % gridSize) - gridSize; y < height + gridSize; y += gridSize) {
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke()
-      }
-
-      // Parallax grid – layer 2 (medium)
-      const mx2 = mouseX * 0.05
-      const my2 = mouseY * 0.05
-      const gridSize2 = 120
-      ctx.strokeStyle = 'rgba(109,40,217,0.05)'
-      ctx.lineWidth = 0.3
-      for (let x = (mx2 % gridSize2) - gridSize2; x < width + gridSize2; x += gridSize2) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke()
-      }
-      for (let y = (my2 % gridSize2) - gridSize2; y < height + gridSize2; y += gridSize2) {
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke()
-      }
-
-      // Floating geometries
-      for (const geo of geos) {
-        geo.rot += geo.rotSpeed
-        // 3D perspective illusion: scale with a sine
-        const scale = 0.85 + 0.15 * Math.sin(t * 0.7 + geo.rotSpeed * 100)
-        const r = geo.r * scale
-        ctx.save()
-        ctx.translate(geo.cx + mouseX * 0.03, geo.cy + mouseY * 0.03)
-        ctx.rotate(geo.rot)
-        ctx.strokeStyle = `rgba(139,92,246,${geo.alpha})`
-        ctx.lineWidth = 0.8
-        ctx.beginPath()
-        for (let i = 0; i <= geo.sides; i++) {
-          const angle = (i / geo.sides) * Math.PI * 2
-          const px = Math.cos(angle) * r
-          const py = Math.sin(angle) * r
-          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py)
-        }
-        ctx.closePath()
-        ctx.stroke()
-        // inner wireframe
-        ctx.globalAlpha = 0.5
-        ctx.beginPath()
-        for (let i = 0; i < geo.sides; i++) {
-          const a1 = (i / geo.sides) * Math.PI * 2
-          const a2 = ((i + 2) / geo.sides) * Math.PI * 2
-          ctx.moveTo(Math.cos(a1) * r, Math.sin(a1) * r)
-          ctx.lineTo(Math.cos(a2) * r * 0.5, Math.sin(a2) * r * 0.5)
-        }
-        ctx.stroke()
-        ctx.globalAlpha = 1
-        ctx.restore()
-      }
-
-      // Particles
-      const curX = (mouseX / 100) * width
-      const curY = (mouseY / 100) * height
-      for (const p of particles) {
-        p.x += p.vx
-        p.y += p.vy
-        if (p.x < 0) p.x = width
-        if (p.x > width) p.x = 0
-        if (p.y < 0) p.y = height
-        if (p.y > height) p.y = 0
-
-        // cursor proximity effect
-        const dx = p.x - curX
-        const dy = p.y - curY
-        const dist = Math.sqrt(dx * dx + dy * dy)
-        const brightAlpha = dist < 120 ? p.alpha + (1 - dist / 120) * 0.4 : p.alpha
-        const size = dist < 80 ? p.size + (1 - dist / 80) * 2 : p.size
-
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, size, 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(139,92,246,${brightAlpha})`
-        ctx.fill()
-      }
-
-      animRef.current = requestAnimationFrame(draw)
-    }
-
-    animRef.current = requestAnimationFrame(draw)
-    return () => {
-      cancelAnimationFrame(animRef.current)
-      window.removeEventListener('resize', resize)
-    }
-  }, []) // run once; mouseX/mouseY are read via closure on render updates
-
-  // keep mouse ref updated without re-running the effect
-  const latestMouse = useRef({ mouseX, mouseY })
-  useEffect(() => { latestMouse.current = { mouseX, mouseY } }, [mouseX, mouseY])
+  useFrame((state, delta) => {
+    if (!meshRef.current) return
+    timeRef.current += delta
+    meshRef.current.rotation.x += delta * 0.1
+    meshRef.current.rotation.y += delta * 0.15
+    // Parallax effect based on mouse
+    meshRef.current.position.x = position[0] + mouseX * 0.003
+    meshRef.current.position.y = position[1] + mouseY * 0.003
+  })
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="absolute inset-0 w-full h-full pointer-events-none"
-      style={{ zIndex: 0 }}
-    />
+    <Float speed={1} rotationIntensity={0.5} floatIntensity={0.5}>
+      <mesh ref={meshRef} position={position}>
+        {geoType === 0 && <icosahedronGeometry args={[0.5, 0]} />}
+        {geoType === 1 && <dodecahedronGeometry args={[0.5, 0]} />}
+        {geoType === 2 && <octahedronGeometry args={[0.5, 0]} />}
+        <meshBasicMaterial color="#8b5cf6" wireframe transparent opacity={0.15} />
+      </mesh>
+    </Float>
   )
 }
 
-// ─── KRONOS central node ──────────────────────────────────────────────────────
+// ─── 3D Torus Knot floating in background ─────────────────────────────────────
+function FloatingTorusKnot({ position, mouseX, mouseY }: { position: [number, number, number]; mouseX: number; mouseY: number }) {
+  const meshRef = useRef<THREE.Mesh>(null)
+
+  useFrame((state, delta) => {
+    if (!meshRef.current) return
+    meshRef.current.rotation.x += delta * 0.05
+    meshRef.current.rotation.z += delta * 0.08
+    meshRef.current.position.x = position[0] + mouseX * 0.005
+    meshRef.current.position.y = position[1] - mouseY * 0.005
+  })
+
+  return (
+    <Float speed={0.5} rotationIntensity={0.3} floatIntensity={0.3}>
+      <mesh ref={meshRef} position={position}>
+        <torusKnotGeometry args={[0.4, 0.1, 64, 8]} />
+        <meshBasicMaterial color="#6d28d9" wireframe transparent opacity={0.1} />
+      </mesh>
+    </Float>
+  )
+}
+
+// ─── Particle field that reacts to cursor ─────────────────────────────────────
+function ParticleField({ mouseX, mouseY, count = 200 }: { mouseX: number; mouseY: number; count?: number }) {
+  const points = useRef<THREE.Points>(null)
+  const positions = useMemo(() => {
+    const pos = new Float32Array(count * 3)
+    for (let i = 0; i < count; i++) {
+      pos[i * 3] = (Math.random() - 0.5) * 20
+      pos[i * 3 + 1] = (Math.random() - 0.5) * 15
+      pos[i * 3 + 2] = (Math.random() - 0.5) * 10
+    }
+    return pos
+  }, [count])
+
+  const originalPositions = useMemo(() => new Float32Array(positions), [positions])
+
+  useFrame((state) => {
+    if (!points.current) return
+    const posArray = points.current.geometry.attributes.position.array as Float32Array
+    const cursorX = mouseX * 0.05
+    const cursorY = mouseY * 0.05
+
+    for (let i = 0; i < count; i++) {
+      const idx = i * 3
+      const ox = originalPositions[idx]
+      const oy = originalPositions[idx + 1]
+      
+      // Distance from cursor in normalized space
+      const dx = ox - cursorX
+      const dy = oy - cursorY
+      const dist = Math.sqrt(dx * dx + dy * dy)
+      
+      // Push particles away from cursor
+      if (dist < 3) {
+        const force = (3 - dist) / 3 * 0.5
+        posArray[idx] = ox + dx * force
+        posArray[idx + 1] = oy + dy * force
+      } else {
+        posArray[idx] = ox
+        posArray[idx + 1] = oy
+      }
+      
+      // Gentle drift
+      posArray[idx + 2] = originalPositions[idx + 2] + Math.sin(state.clock.elapsedTime + i * 0.1) * 0.1
+    }
+    points.current.geometry.attributes.position.needsUpdate = true
+  })
+
+  return (
+    <points ref={points}>
+      <bufferGeometry>
+        <bufferAttribute
+          attach="attributes-position"
+          count={count}
+          array={positions}
+          itemSize={3}
+        />
+      </bufferGeometry>
+      <pointsMaterial color="#8b5cf6" size={0.03} transparent opacity={0.6} sizeAttenuation />
+    </points>
+  )
+}
+
+// ─── Animated 3D Grid ─────────────────────────────────────────────────────────
+function AnimatedGrid({ mouseX, mouseY }: { mouseX: number; mouseY: number }) {
+  const gridRef = useRef<THREE.Group>(null)
+
+  useFrame((state, delta) => {
+    if (!gridRef.current) return
+    gridRef.current.rotation.x = -Math.PI / 2 + mouseY * 0.002
+    gridRef.current.rotation.z = mouseX * 0.001
+    gridRef.current.position.y = -2 + Math.sin(state.clock.elapsedTime * 0.5) * 0.1
+  })
+
+  return (
+    <group ref={gridRef}>
+      <gridHelper args={[50, 50, '#8b5cf620', '#6d28d910']} />
+    </group>
+  )
+}
+
+// ─── Three.js Scene ───────────────────────────────────────────────────────────
+function ThreeScene({ mouseX, mouseY }: { mouseX: number; mouseY: number }) {
+  return (
+    <>
+      <ambientLight intensity={0.1} />
+      <pointLight position={[10, 10, 10]} intensity={0.2} color="#8b5cf6" />
+      
+      {/* Stars in deep background */}
+      <Stars radius={100} depth={50} count={1000} factor={2} saturation={0} fade speed={0.5} />
+      
+      {/* Animated grid floor */}
+      <AnimatedGrid mouseX={mouseX} mouseY={mouseY} />
+      
+      {/* Floating geometries at different depths (parallax layers) */}
+      {/* Layer 1 - furthest, slowest parallax */}
+      <MorphingGeometry position={[-5, 3, -8]} mouseX={mouseX * 0.3} mouseY={mouseY * 0.3} />
+      <MorphingGeometry position={[6, -2, -10]} mouseX={mouseX * 0.3} mouseY={mouseY * 0.3} />
+      <FloatingTorusKnot position={[0, 4, -12]} mouseX={mouseX * 0.2} mouseY={mouseY * 0.2} />
+      
+      {/* Layer 2 - medium depth */}
+      <MorphingGeometry position={[-4, -3, -5]} mouseX={mouseX * 0.5} mouseY={mouseY * 0.5} />
+      <MorphingGeometry position={[5, 2, -6]} mouseX={mouseX * 0.5} mouseY={mouseY * 0.5} />
+      <FloatingTorusKnot position={[-6, 0, -7]} mouseX={mouseX * 0.5} mouseY={mouseY * 0.5} />
+      
+      {/* Layer 3 - closest, fastest parallax */}
+      <MorphingGeometry position={[3, -4, -3]} mouseX={mouseX * 0.8} mouseY={mouseY * 0.8} />
+      <FloatingTorusKnot position={[-3, 3, -4]} mouseX={mouseX * 0.8} mouseY={mouseY * 0.8} />
+      
+      {/* Particle field */}
+      <ParticleField mouseX={mouseX} mouseY={mouseY} count={200} />
+    </>
+  )
+}
+
+// ─── Three.js Background wrapper with post-processing ─────────────────────────
+const ThreeBackground = memo(function ThreeBackground({ 
+  mouseX, 
+  mouseY, 
+  panVelocity = 0 
+}: { 
+  mouseX: number
+  mouseY: number
+  panVelocity?: number
+}) {
+  return (
+    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 0 }}>
+      <Canvas
+        camera={{ position: [0, 0, 8], fov: 60 }}
+        style={{ background: 'transparent' }}
+        gl={{ alpha: true, antialias: true }}
+        dpr={[1, 2]}
+      >
+        <ThreeScene mouseX={mouseX} mouseY={mouseY} />
+      </Canvas>
+      {/* Chromatic aberration overlay on fast pan */}
+      <div 
+        className="absolute inset-0 pointer-events-none transition-opacity duration-150"
+        style={{
+          opacity: Math.min(panVelocity * 0.01, 0.4),
+          background: 'linear-gradient(90deg, rgba(255,0,0,0.1), transparent, rgba(0,0,255,0.1))',
+          mixBlendMode: 'screen',
+        }}
+      />
+    </div>
+  )
+})
+
+// ─── KRONOS central node with 3D hexagon ──────────────────────────────────────
 function KronosNode({ data }: NodeProps) {
-  const controls = useAnimation()
   const [ripple, setRipple] = useState(0)
+  const rotationRef = useRef(0)
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -238,194 +344,331 @@ function KronosNode({ data }: NodeProps) {
     return () => clearInterval(interval)
   }, [])
 
+  // Continuous slow rotation
+  useEffect(() => {
+    let frame: number
+    const animate = () => {
+      rotationRef.current += 0.3
+      frame = requestAnimationFrame(animate)
+    }
+    frame = requestAnimationFrame(animate)
+    return () => cancelAnimationFrame(frame)
+  }, [])
+
   return (
-    <div className="relative flex items-center justify-center" style={{ width: 120, height: 120 }}>
-      {/* Ripple */}
+    <div className="relative flex items-center justify-center" style={{ width: 140, height: 140 }}>
+      {/* Ripple waves */}
       <AnimatePresence>
         <motion.div
           key={ripple}
-          className="absolute rounded-full border border-purple-500/40 pointer-events-none"
-          style={{ width: 80, height: 80 }}
-          initial={{ scale: 1, opacity: 0.6 }}
-          animate={{ scale: 3.5, opacity: 0 }}
+          className="absolute rounded-full pointer-events-none"
+          style={{ 
+            width: 100, 
+            height: 100,
+            border: '2px solid rgba(139,92,246,0.4)',
+            boxShadow: '0 0 20px rgba(139,92,246,0.3), inset 0 0 20px rgba(139,92,246,0.1)'
+          }}
+          initial={{ scale: 1, opacity: 0.8 }}
+          animate={{ scale: 4, opacity: 0 }}
           exit={{}}
-          transition={{ duration: 2.5, ease: 'easeOut' }}
+          transition={{ duration: 3, ease: 'easeOut' }}
         />
       </AnimatePresence>
 
-      {/* Outer hex ring */}
+      {/* Outer rotating hex ring */}
       <motion.div
         className="absolute inset-0 flex items-center justify-center"
         animate={{ rotate: 360 }}
-        transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}
+        transition={{ duration: 25, repeat: Infinity, ease: 'linear' }}
+      >
+        <svg width="140" height="140" viewBox="0 0 140 140">
+          <defs>
+            <linearGradient id="hexGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="#8b5cf6" stopOpacity="0.6" />
+              <stop offset="50%" stopColor="#6d28d9" stopOpacity="0.3" />
+              <stop offset="100%" stopColor="#8b5cf6" stopOpacity="0.6" />
+            </linearGradient>
+          </defs>
+          <polygon
+            points="70,5 125,37 125,103 70,135 15,103 15,37"
+            fill="none"
+            stroke="url(#hexGrad)"
+            strokeWidth="1.5"
+            strokeDasharray="12 6"
+          />
+        </svg>
+      </motion.div>
+
+      {/* Middle counter-rotating ring */}
+      <motion.div
+        className="absolute inset-0 flex items-center justify-center"
+        animate={{ rotate: -360 }}
+        transition={{ duration: 40, repeat: Infinity, ease: 'linear' }}
       >
         <svg width="120" height="120" viewBox="0 0 120 120">
           <polygon
             points="60,8 106,33 106,87 60,112 14,87 14,33"
             fill="none"
-            stroke="rgba(139,92,246,0.35)"
+            stroke="rgba(139,92,246,0.2)"
             strokeWidth="1"
-            strokeDasharray="8 4"
+            strokeDasharray="4 8"
           />
         </svg>
       </motion.div>
 
-      {/* Main hexagon */}
+      {/* Main 3D-effect hexagon */}
       <motion.div
         className="relative flex items-center justify-center"
-        animate={{ scale: [1, 1.03, 1] }}
-        transition={{ duration: 2.5, repeat: Infinity, ease: 'easeInOut' }}
-        style={{ filter: 'drop-shadow(0 0 18px rgba(139,92,246,0.7))' }}
+        animate={{ 
+          scale: [1, 1.04, 1],
+          rotateY: [0, 5, 0, -5, 0],
+        }}
+        transition={{ 
+          scale: { duration: 3, repeat: Infinity, ease: 'easeInOut' },
+          rotateY: { duration: 8, repeat: Infinity, ease: 'easeInOut' }
+        }}
+        style={{ 
+          filter: 'drop-shadow(0 0 25px rgba(139,92,246,0.8)) drop-shadow(0 0 50px rgba(139,92,246,0.4))',
+          transformStyle: 'preserve-3d',
+          perspective: '500px'
+        }}
       >
-        <svg width="88" height="88" viewBox="0 0 88 88">
+        <svg width="100" height="100" viewBox="0 0 100 100">
           <defs>
-            <radialGradient id="kg" cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor="#a78bfa" />
-              <stop offset="60%" stopColor="#7c3aed" />
+            <radialGradient id="kronosGrad" cx="50%" cy="30%" r="70%">
+              <stop offset="0%" stopColor="#c4b5fd" />
+              <stop offset="40%" stopColor="#8b5cf6" />
+              <stop offset="70%" stopColor="#6d28d9" />
               <stop offset="100%" stopColor="#4c1d95" />
             </radialGradient>
+            <filter id="innerGlow">
+              <feGaussianBlur stdDeviation="2" result="blur" />
+              <feComposite in="SourceGraphic" in2="blur" operator="over" />
+            </filter>
           </defs>
+          
+          {/* Shadow hex for 3D depth */}
           <polygon
-            points="44,6 78,25 78,63 44,82 10,63 10,25"
-            fill="url(#kg)"
-            stroke="#8b5cf6"
-            strokeWidth="1.5"
+            points="52,10 88,30 88,70 52,90 16,70 16,30"
+            fill="rgba(0,0,0,0.5)"
+            transform="translate(2, 3)"
           />
-          {/* Inner hex */}
+          
+          {/* Main hex */}
           <polygon
-            points="44,20 64,31 64,53 44,64 24,53 24,31"
-            fill="rgba(139,92,246,0.2)"
-            stroke="rgba(167,139,250,0.5)"
-            strokeWidth="0.8"
+            points="50,8 86,28 86,72 50,92 14,72 14,28"
+            fill="url(#kronosGrad)"
+            stroke="#a78bfa"
+            strokeWidth="2"
+            filter="url(#innerGlow)"
+          />
+          
+          {/* Inner glowing hex */}
+          <polygon
+            points="50,22 72,34 72,58 50,70 28,58 28,34"
+            fill="rgba(139,92,246,0.3)"
+            stroke="rgba(196,181,253,0.6)"
+            strokeWidth="1"
+          />
+          
+          {/* Core hex */}
+          <polygon
+            points="50,32 62,39 62,53 50,60 38,53 38,39"
+            fill="rgba(167,139,250,0.4)"
+            stroke="rgba(196,181,253,0.8)"
+            strokeWidth="0.5"
           />
         </svg>
 
         {/* Label */}
         <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <span
-            className="font-mono font-bold text-white tracking-widest"
-            style={{ fontSize: 10, lineHeight: 1, letterSpacing: '0.18em' }}
+          <motion.span
+            className="font-mono font-black text-white tracking-[0.25em]"
+            style={{ fontSize: 11, lineHeight: 1, textShadow: '0 0 10px rgba(139,92,246,0.8)' }}
+            animate={{ opacity: [0.9, 1, 0.9] }}
+            transition={{ duration: 2, repeat: Infinity }}
           >
             KRONOS
-          </span>
-          <span className="font-mono text-purple-300 mt-0.5" style={{ fontSize: 7 }}>
-            CORE
+          </motion.span>
+          <span className="font-mono text-purple-300/80 mt-0.5" style={{ fontSize: 7, letterSpacing: '0.2em' }}>
+            NEURAL CORE
           </span>
         </div>
       </motion.div>
 
-      {/* Pulsing dot */}
-      <div className="absolute bottom-1 right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 animate-status-pulse" />
+      {/* Orbiting particles */}
+      {[0, 1, 2].map(i => (
+        <motion.div
+          key={i}
+          className="absolute w-1.5 h-1.5 rounded-full bg-purple-400"
+          style={{ 
+            boxShadow: '0 0 8px rgba(139,92,246,0.8)',
+            transformOrigin: '70px 70px'
+          }}
+          animate={{ rotate: 360 }}
+          transition={{ duration: 4 + i * 2, repeat: Infinity, ease: 'linear', delay: i * 1.3 }}
+        />
+      ))}
 
-      {/* RF handles — invisible, positioned at center */}
-      <Handle type="source" position={Position.Right} style={{ opacity: 0, pointerEvents: 'none', width: 1, height: 1, minWidth: 1, minHeight: 1, border: 'none', background: 'transparent' }} />
-      <Handle type="target" position={Position.Left} style={{ opacity: 0, pointerEvents: 'none', width: 1, height: 1, minWidth: 1, minHeight: 1, border: 'none', background: 'transparent' }} />
+      {/* Status indicator */}
+      <motion.div 
+        className="absolute bottom-2 right-2 w-3 h-3 rounded-full bg-emerald-400"
+        style={{ boxShadow: '0 0 10px rgba(16,185,129,0.8)' }}
+        animate={{ scale: [1, 1.3, 1], opacity: [1, 0.6, 1] }}
+        transition={{ duration: 1.5, repeat: Infinity }}
+      />
+
+      {/* RF handles */}
+      <Handle type="source" position={Position.Right} style={{ opacity: 0, pointerEvents: 'none' }} />
+      <Handle type="target" position={Position.Left} style={{ opacity: 0, pointerEvents: 'none' }} />
     </div>
   )
 }
 
-// ─── Satellite agent node ─────────────────────────────────────────────────────
+// ─── Satellite agent node with glassmorphism ──────────────────────────────────
 function AgentNodeComponent({ data, selected }: NodeProps) {
   const status: AgentStatus = (data?.status as AgentStatus) ?? 'idle'
   const color = statusColors[status]
-  const bg = statusBg[status]
+  const [isFlipping, setIsFlipping] = useState(false)
+  const prevStatus = useRef(status)
+
+  // Flip animation when status changes
+  useEffect(() => {
+    if (prevStatus.current !== status) {
+      setIsFlipping(true)
+      setTimeout(() => setIsFlipping(false), 600)
+      prevStatus.current = status
+    }
+  }, [status])
 
   return (
     <Tilt
-      tiltMaxAngleX={12}
-      tiltMaxAngleY={12}
+      tiltMaxAngleX={15}
+      tiltMaxAngleY={15}
       glareEnable={true}
-      glareMaxOpacity={0.08}
+      glareMaxOpacity={0.12}
       glareColor="#8b5cf6"
       glarePosition="all"
-      perspective={600}
-      transitionSpeed={300}
-      scale={1.04}
+      perspective={800}
+      transitionSpeed={400}
+      scale={1.05}
       style={{ transformStyle: 'preserve-3d' }}
     >
       <motion.div
-        className="relative rounded-lg overflow-hidden cursor-pointer select-none"
+        className="relative rounded-xl overflow-hidden cursor-pointer select-none"
         style={{
-          width: 140,
-          background: 'rgba(0,0,0,0.75)',
+          width: 160,
+          background: 'rgba(10,10,11,0.85)',
           border: `1px solid ${selected ? color : 'rgba(139,92,246,0.3)'}`,
-          backdropFilter: 'blur(16px)',
+          backdropFilter: 'blur(20px)',
           boxShadow: selected
-            ? `0 0 20px ${color}55, inset 0 0 8px ${color}22`
-            : `0 0 8px rgba(139,92,246,0.2)`,
+            ? `0 0 30px ${color}66, 0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05)`
+            : `0 0 15px rgba(139,92,246,0.2), 0 8px 32px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.03)`,
+          transformStyle: 'preserve-3d',
         }}
-        animate={{ scale: [1, 1.015, 1] }}
+        animate={{ 
+          scale: status === 'idle' ? [1, 1.02, 1] : status === 'executing' ? [1, 1.03, 1] : [1, 1.015, 1],
+          rotateY: isFlipping ? [0, 360] : 0,
+        }}
         transition={{
-          duration: status === 'idle' ? 4 : status === 'executing' ? 1.2 : 2,
-          repeat: Infinity,
-          ease: 'easeInOut',
+          scale: { duration: status === 'idle' ? 4 : status === 'executing' ? 1.5 : 2.5, repeat: Infinity, ease: 'easeInOut' },
+          rotateY: { duration: 0.6, ease: 'easeInOut' }
         }}
-        whileHover={{ scale: 1.08 }}
-        whileTap={{ scale: 0.96 }}
+        whileHover={{ 
+          scale: 1.1,
+          boxShadow: `0 0 40px ${color}88, 0 12px 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.1)`,
+        }}
+        whileTap={{ scale: 0.95 }}
       >
-        {/* Top status bar */}
-        <div
+        {/* Top glow bar */}
+        <motion.div
           className="h-0.5 w-full"
           style={{ background: `linear-gradient(90deg, transparent, ${color}, transparent)` }}
+          animate={{ opacity: [0.5, 1, 0.5] }}
+          transition={{ duration: 2, repeat: Infinity }}
         />
 
-        <div className="px-3 py-2.5">
-          {/* Status row */}
-          <div className="flex items-center justify-between mb-1.5">
-            <div className="flex items-center gap-1.5">
+        <div className="px-3 py-3">
+          {/* Status indicator row */}
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
               <motion.div
-                className="w-2 h-2 rounded-full shrink-0"
-                style={{ background: color, boxShadow: `0 0 6px ${color}` }}
-                animate={status !== 'idle' ? { opacity: [1, 0.4, 1], scale: [1, 1.3, 1] } : {}}
-                transition={{ duration: 1.2, repeat: Infinity }}
+                className="w-2.5 h-2.5 rounded-full shrink-0"
+                style={{ 
+                  background: color, 
+                  boxShadow: `0 0 10px ${color}` 
+                }}
+                animate={status !== 'idle' ? { 
+                  opacity: [1, 0.3, 1], 
+                  scale: [1, 1.4, 1],
+                  boxShadow: [`0 0 10px ${color}`, `0 0 20px ${color}`, `0 0 10px ${color}`]
+                } : {}}
+                transition={{ duration: 1, repeat: Infinity }}
               />
-              <span className="font-mono text-[9px] tracking-wider" style={{ color }}>
+              <span className="font-mono text-[9px] tracking-wider uppercase" style={{ color }}>
                 {statusLabels[status]}
               </span>
             </div>
+            {data?.latency && (
+              <span className="font-mono text-[8px] text-purple-400/60">{data.latency as number}ms</span>
+            )}
           </div>
 
-          {/* Name */}
-          <p
-            className="font-mono font-bold text-white leading-tight truncate"
-            style={{ fontSize: 11 }}
-          >
+          {/* Agent name */}
+          <p className="font-mono font-bold text-white leading-tight truncate text-sm mb-0.5">
             {data?.name as string}
           </p>
+          
           {data?.device && (
-            <p className="font-mono text-[9px] text-purple-400 mt-0.5">
+            <p className="font-mono text-[9px] text-purple-400/70 mb-1.5">
               {data.device as string}
             </p>
           )}
 
-          {/* Last action */}
+          {/* Last action with scrolling text effect */}
           {data?.lastAction && (
-            <p
-              className="font-mono text-[8px] text-gray-500 mt-1.5 truncate"
-              style={{ letterSpacing: '0.03em' }}
-            >
-              {data.lastAction as string}
-            </p>
+            <div className="relative overflow-hidden">
+              <motion.p
+                className="font-mono text-[8px] text-gray-500 whitespace-nowrap"
+                animate={{ x: [0, -100, 0] }}
+                transition={{ duration: 10, repeat: Infinity, ease: 'linear' }}
+              >
+                {data.lastAction as string}
+              </motion.p>
+            </div>
           )}
 
-          {/* Latency */}
-          {data?.latency && (
-            <div className="flex items-center justify-between mt-1.5">
-              <span className="font-mono text-[8px] text-gray-600">LATENCY</span>
-              <span className="font-mono text-[8px] text-purple-400">{data.latency as number}ms</span>
-            </div>
+          {/* Data stream visualization */}
+          {status === 'executing' && (
+            <motion.div 
+              className="mt-2 h-1 rounded-full overflow-hidden"
+              style={{ background: 'rgba(139,92,246,0.2)' }}
+            >
+              <motion.div
+                className="h-full rounded-full"
+                style={{ background: `linear-gradient(90deg, transparent, ${color}, transparent)` }}
+                animate={{ x: ['-100%', '100%'] }}
+                transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+              />
+            </motion.div>
           )}
         </div>
 
-        {/* Bottom accent */}
+        {/* Bottom accent line */}
         <div
           className="absolute bottom-0 left-0 right-0 h-px"
           style={{ background: `linear-gradient(90deg, transparent, ${color}66, transparent)` }}
         />
 
-        {/* RF handles — invisible */}
-        <Handle type="target" position={Position.Left} style={{ opacity: 0, pointerEvents: 'none', width: 1, height: 1, minWidth: 1, minHeight: 1, border: 'none', background: 'transparent' }} />
-        <Handle type="source" position={Position.Right} style={{ opacity: 0, pointerEvents: 'none', width: 1, height: 1, minWidth: 1, minHeight: 1, border: 'none', background: 'transparent' }} />
+        {/* Corner accents */}
+        <div className="absolute top-0 left-0 w-3 h-3 border-l border-t border-purple-500/30" />
+        <div className="absolute top-0 right-0 w-3 h-3 border-r border-t border-purple-500/30" />
+        <div className="absolute bottom-0 left-0 w-3 h-3 border-l border-b border-purple-500/30" />
+        <div className="absolute bottom-0 right-0 w-3 h-3 border-r border-b border-purple-500/30" />
+
+        {/* RF handles */}
+        <Handle type="target" position={Position.Left} style={{ opacity: 0, pointerEvents: 'none' }} />
+        <Handle type="source" position={Position.Right} style={{ opacity: 0, pointerEvents: 'none' }} />
       </motion.div>
     </Tilt>
   )
@@ -436,8 +679,7 @@ const nodeTypes = {
   agent: AgentNodeComponent,
 }
 
-// ─── SVG overlay that draws all edges using live node positions ───────────────
-// This completely bypasses RF's connection system.
+// ─── SVG edges with flowing particles and data streams ────────────────────────
 function EdgesOverlay({
   agents,
   highlightedNode,
@@ -446,15 +688,17 @@ function EdgesOverlay({
   highlightedNode: string | null
 }) {
   const rfNodes = useNodes()
-  const [, setTick] = useState(0)
-
-  // Animate particles by ticking every frame
+  const [tick, setTick] = useState(0)
   const tickRef = useRef(0)
+
+  // High-performance animation loop
   useEffect(() => {
     let id: number
     const loop = () => {
       tickRef.current += 1
-      setTick(t => t + 1)
+      if (tickRef.current % 2 === 0) { // Update every other frame for perf
+        setTick(t => t + 1)
+      }
       id = requestAnimationFrame(loop)
     }
     id = requestAnimationFrame(loop)
@@ -464,13 +708,12 @@ function EdgesOverlay({
   const kronosNode = rfNodes.find(n => n.id === 'kronos')
   if (!kronosNode) return null
 
-  // Center of the KRONOS node (node position is top-left, width=120, height=120)
-  const kx = kronosNode.position.x + 60
-  const ky = kronosNode.position.y + 60
+  const kx = kronosNode.position.x + 70
+  const ky = kronosNode.position.y + 70
 
   return (
     <svg
-      className="react-flow__edges-overlay pointer-events-none"
+      className="pointer-events-none"
       style={{
         position: 'absolute',
         top: 0,
@@ -481,63 +724,156 @@ function EdgesOverlay({
         zIndex: 1,
       }}
     >
+      <defs>
+        {/* Glow filter */}
+        <filter id="edgeGlow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+        
+        {/* Gradient for edges */}
+        <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stopColor="#8b5cf6" stopOpacity="0.8" />
+          <stop offset="50%" stopColor="#a78bfa" stopOpacity="1" />
+          <stop offset="100%" stopColor="#8b5cf6" stopOpacity="0.8" />
+        </linearGradient>
+        
+        <linearGradient id="amberGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.8" />
+          <stop offset="50%" stopColor="#fbbf24" stopOpacity="1" />
+          <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.8" />
+        </linearGradient>
+      </defs>
+
       {agents.map((agent, agentIdx) => {
         const agentNode = rfNodes.find(n => n.id === agent.id)
         if (!agentNode) return null
 
-        const ax = agentNode.position.x + 70
-        const ay = agentNode.position.y + 40
+        const ax = agentNode.position.x + 80
+        const ay = agentNode.position.y + 45
         const isHighlighted = highlightedNode === agent.id || highlightedNode === 'kronos'
-        const color = agent.status === 'executing'
-          ? '#f59e0b'
-          : isHighlighted
-          ? '#a78bfa'
-          : '#8b5cf6'
+        const isExecuting = agent.status === 'executing'
+        const baseColor = isExecuting ? '#f59e0b' : '#8b5cf6'
+        const brightColor = isExecuting ? '#fbbf24' : '#a78bfa'
 
-        // Cubic bezier
+        // Smooth bezier curve
         const dx = (ax - kx) * 0.5
         const d = `M${kx},${ky} C${kx + dx},${ky} ${ax - dx},${ay} ${ax},${ay}`
 
-        // 4 particles per edge
-        const numParticles = agent.status === 'idle' ? 2 : 4
+        // Calculate path length for dash animation
+        const pathLength = Math.sqrt(Math.pow(ax - kx, 2) + Math.pow(ay - ky, 2)) * 1.5
+
+        // Particles along path
+        const numParticles = isExecuting ? 6 : 3
         const particles = Array.from({ length: numParticles }, (_, i) => {
           const baseT = i / numParticles
-          const speed = 0.003 + i * 0.0015
+          const speed = isExecuting ? 0.008 + i * 0.002 : 0.004 + i * 0.001
           const t = ((baseT + tickRef.current * speed) % 1 + 1) % 1
           const mt = 1 - t
           const c1x = kx + dx; const c1y = ky
           const c2x = ax - dx; const c2y = ay
           const px = mt*mt*mt*kx + 3*mt*mt*t*c1x + 3*mt*t*t*c2x + t*t*t*ax
           const py = mt*mt*mt*ky + 3*mt*mt*t*c1y + 3*mt*t*t*c2y + t*t*t*ay
-          const alpha = 0.5 + Math.sin(t * Math.PI * 2 + agentIdx) * 0.4
-          return { px, py, alpha }
+          const alpha = 0.4 + Math.sin(t * Math.PI * 2 + agentIdx) * 0.4
+          const size = isExecuting ? 3.5 + Math.sin(t * Math.PI) * 1.5 : 2.5 + Math.sin(t * Math.PI) * 1
+          return { px, py, alpha, size, t }
         })
+
+        // Data stream text positions (only for executing)
+        const dataStreams = isExecuting ? Array.from({ length: 2 }, (_, i) => {
+          const baseT = i * 0.5
+          const speed = 0.003
+          const t = ((baseT + tickRef.current * speed) % 1 + 1) % 1
+          const mt = 1 - t
+          const c1x = kx + dx; const c1y = ky
+          const c2x = ax - dx; const c2y = ay
+          const px = mt*mt*mt*kx + 3*mt*mt*t*c1x + 3*mt*t*t*c2x + t*t*t*ax
+          const py = mt*mt*mt*ky + 3*mt*mt*t*c1y + 3*mt*t*t*c2y + t*t*t*ay
+          return { px, py, t }
+        }) : []
 
         return (
           <g key={agent.id}>
-            {/* Glow */}
-            <path d={d} stroke={color} strokeWidth={isHighlighted ? 10 : 6} fill="none" opacity={0.08} strokeLinecap="round" style={{ filter: `blur(${isHighlighted ? 6 : 4}px)` }} />
+            {/* Outer glow layer */}
+            <path
+              d={d}
+              stroke={baseColor}
+              strokeWidth={isHighlighted ? 14 : 8}
+              fill="none"
+              opacity={0.1}
+              strokeLinecap="round"
+              filter="url(#edgeGlow)"
+            />
+            
+            {/* Middle glow */}
+            <path
+              d={d}
+              stroke={baseColor}
+              strokeWidth={isHighlighted ? 6 : 4}
+              fill="none"
+              opacity={isHighlighted ? 0.3 : 0.15}
+              strokeLinecap="round"
+            />
+
             {/* Core line */}
             <path
               d={d}
-              stroke={color}
-              strokeWidth={isHighlighted ? 2 : 1.5}
+              stroke={isExecuting ? 'url(#amberGrad)' : 'url(#purpleGrad)'}
+              strokeWidth={isHighlighted ? 2.5 : 1.8}
               fill="none"
-              opacity={isHighlighted ? 0.9 : 0.45}
+              opacity={isHighlighted ? 1 : 0.6}
               strokeLinecap="round"
-              strokeDasharray={agent.status === 'executing' ? '6 3' : undefined}
+              strokeDasharray={isExecuting ? '8 4' : undefined}
+              strokeDashoffset={isExecuting ? -tickRef.current * 0.5 : 0}
             />
-            {/* Particles */}
+
+            {/* Flowing particles */}
             {particles.map((p, i) => (
-              <circle
+              <g key={i}>
+                {/* Particle glow */}
+                <circle
+                  cx={p.px}
+                  cy={p.py}
+                  r={p.size * 2}
+                  fill={baseColor}
+                  opacity={p.alpha * 0.2}
+                />
+                {/* Particle core */}
+                <circle
+                  cx={p.px}
+                  cy={p.py}
+                  r={p.size}
+                  fill={brightColor}
+                  opacity={p.alpha}
+                />
+                {/* Particle bright center */}
+                <circle
+                  cx={p.px}
+                  cy={p.py}
+                  r={p.size * 0.4}
+                  fill="white"
+                  opacity={p.alpha * 0.8}
+                />
+              </g>
+            ))}
+
+            {/* Data stream text (only when executing) */}
+            {dataStreams.map((ds, i) => (
+              <text
                 key={i}
-                cx={p.px}
-                cy={p.py}
-                r={agent.status === 'executing' ? 2.8 : 2}
-                fill={color}
-                opacity={p.alpha}
-                style={{ filter: `drop-shadow(0 0 4px ${color})` }}
-              />
+                x={ds.px}
+                y={ds.py - 8}
+                fill={brightColor}
+                fontSize="7"
+                fontFamily="monospace"
+                opacity={0.6}
+                textAnchor="middle"
+              >
+                {['CMD', 'DATA', 'SYNC', 'EXEC'][i % 4]}
+              </text>
             ))}
           </g>
         )
@@ -546,42 +882,143 @@ function EdgesOverlay({
   )
 }
 
-// ─── Custom cursor ────────────────────────────────────────────────────────────
+// ─── Custom cursor with glow trail ────────────────────────────────────────────
 function CustomCursor({ x, y }: { x: number; y: number }) {
+  const springConfig = { stiffness: 1000, damping: 50, mass: 0.1 }
+  const cursorX = useSpring(x, springConfig)
+  const cursorY = useSpring(y, springConfig)
+  
+  const trailConfig = { stiffness: 300, damping: 30, mass: 0.5 }
+  const trailX = useSpring(x, trailConfig)
+  const trailY = useSpring(y, trailConfig)
+
+  useEffect(() => {
+    cursorX.set(x)
+    cursorY.set(y)
+    trailX.set(x)
+    trailY.set(y)
+  }, [x, y, cursorX, cursorY, trailX, trailY])
+
   return (
     <>
+      {/* Trail glow */}
+      <motion.div
+        className="fixed pointer-events-none z-[9997] rounded-full"
+        style={{
+          width: 40,
+          height: 40,
+          background: 'radial-gradient(circle, rgba(139,92,246,0.3) 0%, transparent 70%)',
+          x: trailX,
+          y: trailY,
+          translateX: '-50%',
+          translateY: '-50%',
+        }}
+      />
+      
+      {/* Outer ring */}
+      <motion.div
+        className="fixed pointer-events-none z-[9998] rounded-full border border-purple-500/50"
+        style={{ 
+          width: 24, 
+          height: 24,
+          x: cursorX,
+          y: cursorY,
+          translateX: '-50%',
+          translateY: '-50%',
+          boxShadow: '0 0 15px rgba(139,92,246,0.3)',
+        }}
+      />
+      
+      {/* Core dot */}
       <motion.div
         className="fixed pointer-events-none z-[9999] rounded-full"
         style={{
           width: 8,
           height: 8,
-          background: '#8b5cf6',
-          boxShadow: '0 0 12px 4px rgba(139,92,246,0.7)',
+          background: '#a78bfa',
+          boxShadow: '0 0 15px 5px rgba(139,92,246,0.8), 0 0 30px 10px rgba(139,92,246,0.4)',
+          x: cursorX,
+          y: cursorY,
+          translateX: '-50%',
+          translateY: '-50%',
         }}
-        animate={{ left: x - 4, top: y - 4 }}
-        transition={{ type: 'spring', stiffness: 800, damping: 40, mass: 0.1 }}
-      />
-      <motion.div
-        className="fixed pointer-events-none z-[9998] rounded-full border border-purple-500/40"
-        style={{ width: 28, height: 28 }}
-        animate={{ left: x - 14, top: y - 14 }}
-        transition={{ type: 'spring', stiffness: 200, damping: 25, mass: 0.5 }}
       />
     </>
   )
 }
 
-// ─── Main inner component (needs ReactFlow context) ──────────────────────────
+// ─── Hyperspace mode component ────────────────────────────────────────────────
+function HyperspaceOverlay({ active }: { active: boolean }) {
+  if (!active) return null
+
+  return (
+    <motion.div
+      className="absolute inset-0 pointer-events-none z-50"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+    >
+      {/* Radial zoom lines */}
+      {Array.from({ length: 50 }).map((_, i) => {
+        const angle = (i / 50) * Math.PI * 2
+        const length = 200 + Math.random() * 300
+        return (
+          <motion.div
+            key={i}
+            className="absolute left-1/2 top-1/2 origin-left"
+            style={{
+              width: length,
+              height: 1,
+              background: `linear-gradient(90deg, transparent, rgba(139,92,246,${0.3 + Math.random() * 0.4}), transparent)`,
+              rotate: `${(angle * 180) / Math.PI}deg`,
+            }}
+            initial={{ scaleX: 0, opacity: 0 }}
+            animate={{ 
+              scaleX: [0, 1, 1.5],
+              opacity: [0, 1, 0],
+            }}
+            transition={{
+              duration: 1.5,
+              delay: Math.random() * 0.5,
+              ease: 'easeOut',
+            }}
+          />
+        )
+      })}
+    </motion.div>
+  )
+}
+
+// ─── Main inner component ─────────────────────────────────────────────────────
 function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
-  const { fitView, zoomIn, zoomOut } = useReactFlow()
+  const { fitView, zoomIn, zoomOut, setViewport, getViewport } = useReactFlow()
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 })
   const [canvasMouseNorm, setCanvasMouseNorm] = useState({ x: 0, y: 0 })
   const [highlightedNode, setHighlightedNode] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [showSearch, setShowSearch] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [hyperspaceMode, setHyperspaceMode] = useState(false)
+  const [sceneRotation, setSceneRotation] = useState({ x: 0, y: 0 })
+  const rightDragRef = useRef(false)
+  const lastMouseRef = useRef({ x: 0, y: 0 })
+  
+  // NEW: Velocity tracking for chromatic aberration
+  const [panVelocity, setPanVelocity] = useState(0)
+  const lastPanPosRef = useRef({ x: 0, y: 0 })
+  const velocityDecayRef = useRef<number | null>(null)
+  
+  // NEW: Sound state
+  const [soundEnabled, setSoundEnabled] = useState(false)
+  
+  // NEW: Magnetic attraction to cursor
+  const magneticRadiusRef = useRef(150)
+  
+  // NEW: Selection box state
+  const [selectionBox, setSelectionBox] = useState<{ start: { x: number; y: number }; end: { x: number; y: number } } | null>(null)
+  const isSelectingRef = useRef(false)
 
-  // Build RF nodes
+  // Build RF nodes in orbital layout
   const initialNodes: Node[] = useMemo(() => {
     const kronosNode: Node = {
       id: 'kronos',
@@ -592,13 +1029,13 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
     }
     const agentNodes: Node[] = agents.map((agent, i) => {
       const angle = (i * 2 * Math.PI) / agents.length - Math.PI / 2
-      const radius = 280
+      const radius = 320
       return {
         id: agent.id,
         type: 'agent',
         position: {
-          x: Math.cos(angle) * radius - 70,
-          y: Math.sin(angle) * radius - 40,
+          x: Math.cos(angle) * radius - 80,
+          y: Math.sin(angle) * radius - 45,
         },
         data: {
           ...agent,
@@ -612,7 +1049,7 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes)
 
-  // Sync agent statuses into nodes
+  // Sync agent statuses
   useEffect(() => {
     setNodes(prev =>
       prev.map(n => {
@@ -624,7 +1061,7 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
     )
   }, [agents, setNodes])
 
-  // Mouse tracking
+  // Mouse tracking with performance optimization and velocity
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     setMousePos({ x: e.clientX, y: e.clientY })
     if (containerRef.current) {
@@ -634,9 +1071,52 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
         y: ((e.clientY - rect.top) / rect.height) * 100 - 50,
       })
     }
+
+    // Right-click drag for scene rotation
+    if (rightDragRef.current) {
+      const dx = e.clientX - lastMouseRef.current.x
+      const dy = e.clientY - lastMouseRef.current.y
+      setSceneRotation(prev => ({
+        x: Math.max(-5, Math.min(5, prev.x + dy * 0.05)),
+        y: Math.max(-5, Math.min(5, prev.y + dx * 0.05)),
+      }))
+      
+      // Calculate pan velocity for chromatic aberration
+      const velocity = Math.sqrt(dx * dx + dy * dy)
+      setPanVelocity(velocity)
+      
+      // Decay velocity
+      if (velocityDecayRef.current) cancelAnimationFrame(velocityDecayRef.current)
+      velocityDecayRef.current = requestAnimationFrame(function decay() {
+        setPanVelocity(v => {
+          if (v < 0.5) return 0
+          velocityDecayRef.current = requestAnimationFrame(decay)
+          return v * 0.92
+        })
+      })
+    }
+    lastMouseRef.current = { x: e.clientX, y: e.clientY }
   }, [])
 
-  // Keyboard shortcut CMD+K
+  // Context menu prevention and right-click rotation
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+  }, [])
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button === 2) {
+      rightDragRef.current = true
+      lastMouseRef.current = { x: e.clientX, y: e.clientY }
+    }
+  }, [])
+
+  const handleMouseUp = useCallback((e: React.MouseEvent) => {
+    if (e.button === 2) {
+      rightDragRef.current = false
+    }
+  }, [])
+
+  // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -644,14 +1124,47 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
         setShowSearch(s => !s)
       }
       if (e.key === 'Escape') setShowSearch(false)
+      if (e.key === 'h' || e.key === 'H') {
+        setHyperspaceMode(true)
+        setTimeout(() => {
+          setHyperspaceMode(false)
+          fitView({ duration: 800, padding: 0.3 })
+        }, 2000)
+      }
+      // Sound toggle with 'M' key
+      if (e.key === 'm' || e.key === 'M') {
+        const isOn = soundEngine?.toggle() ?? false
+        setSoundEnabled(isOn)
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
+  }, [fitView])
+
+  // Update sound intensity based on active agents
+  useEffect(() => {
+    if (soundEnabled && soundEngine) {
+      const activeCount = agents.filter(a => a.status === 'executing' || a.status === 'listening').length
+      soundEngine.setIntensity(activeCount)
+    }
+  }, [agents, soundEnabled])
+
+  // Device orientation for mobile (gyroscope)
+  useEffect(() => {
+    const handler = (e: DeviceOrientationEvent) => {
+      if (e.gamma !== null && e.beta !== null) {
+        setSceneRotation({
+          x: Math.max(-5, Math.min(5, e.beta * 0.1)),
+          y: Math.max(-5, Math.min(5, e.gamma * 0.1)),
+        })
+      }
+    }
+    window.addEventListener('deviceorientation', handler)
+    return () => window.removeEventListener('deviceorientation', handler)
   }, [])
 
-  // Double-click empty space → fit view
   const onPaneDoubleClick = useCallback(() => {
-    fitView({ duration: 600, padding: 0.25 })
+    fitView({ duration: 700, padding: 0.25 })
   }, [fitView])
 
   const handleNodeClick = useCallback(
@@ -666,11 +1179,11 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
   const handleNodeMouseEnter = useCallback((_: React.MouseEvent, node: Node) => {
     setHighlightedNode(node.id)
   }, [])
+
   const handleNodeMouseLeave = useCallback(() => {
     setHighlightedNode(null)
   }, [])
 
-  // Search fly-to
   const handleSearch = useCallback(
     (q: string) => {
       const node = nodes.find(n =>
@@ -678,11 +1191,12 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
         n.id.toLowerCase().includes(q.toLowerCase())
       )
       if (node) {
-        fitView({ nodes: [node], duration: 700, padding: 0.5 })
+        fitView({ nodes: [node], duration: 800, padding: 0.6 })
         setHighlightedNode(node.id)
-        setTimeout(() => setHighlightedNode(null), 2000)
+        setTimeout(() => setHighlightedNode(null), 2500)
       }
       setShowSearch(false)
+      setSearchQuery('')
     },
     [nodes, fitView]
   )
@@ -690,139 +1204,212 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full"
+      className="relative w-full h-full overflow-hidden"
       onMouseMove={handleMouseMove}
-      style={{ cursor: 'none' }}
+      onContextMenu={handleContextMenu}
+      onMouseDown={handleMouseDown}
+      onMouseUp={handleMouseUp}
+      style={{ 
+        cursor: 'none',
+        perspective: '1000px',
+      }}
     >
       {/* Custom cursor */}
       <CustomCursor x={mousePos.x} y={mousePos.y} />
 
-      {/* Three.js background */}
-      <ThreeBackground mouseX={canvasMouseNorm.x} mouseY={canvasMouseNorm.y} />
+      {/* Hyperspace overlay */}
+      <AnimatePresence>
+        {hyperspaceMode && <HyperspaceOverlay active={hyperspaceMode} />}
+      </AnimatePresence>
 
-      {/* ReactFlow */}
-      <ReactFlow
-        nodes={nodes}
-        onNodesChange={onNodesChange}
-        onNodeClick={handleNodeClick}
-        onNodeMouseEnter={handleNodeMouseEnter}
-        onNodeMouseLeave={handleNodeMouseLeave}
-        onPaneClick={() => setHighlightedNode(null)}
-        onDoubleClick={onPaneDoubleClick}
-        nodeTypes={nodeTypes}
-        minZoom={0.2}
-        maxZoom={3}
-        defaultViewport={{ x: 420, y: 200, zoom: 0.85 }}
-        panOnDrag
-        zoomOnScroll
-        zoomOnPinch
-        fitView={false}
-        style={{ background: 'transparent', position: 'absolute', inset: 0, zIndex: 1 }}
-        proOptions={{ hideAttribution: true }}
+      {/* 3D scene rotation wrapper */}
+      <motion.div
+        className="absolute inset-0"
+        style={{
+          transformStyle: 'preserve-3d',
+        }}
+        animate={{
+          rotateX: sceneRotation.x,
+          rotateY: sceneRotation.y,
+        }}
+        transition={{ type: 'spring', stiffness: 100, damping: 20 }}
       >
-        <Background
-          variant={BackgroundVariant.Dots}
-          gap={28}
-          size={1}
-          color="rgba(139,92,246,0.12)"
-          style={{ zIndex: 0 }}
-        />
+        {/* Three.js background */}
+        <ThreeBackground mouseX={canvasMouseNorm.x} mouseY={canvasMouseNorm.y} panVelocity={panVelocity} />
 
-        {/* Custom edges SVG overlay — reads live node positions */}
-        <EdgesOverlay agents={agents} highlightedNode={highlightedNode} />
+        {/* ReactFlow */}
+        <ReactFlow
+          nodes={nodes}
+          onNodesChange={onNodesChange}
+          onNodeClick={handleNodeClick}
+          onNodeMouseEnter={handleNodeMouseEnter}
+          onNodeMouseLeave={handleNodeMouseLeave}
+          onPaneClick={() => setHighlightedNode(null)}
+          onDoubleClick={onPaneDoubleClick}
+          nodeTypes={nodeTypes}
+          minZoom={0.2}
+          maxZoom={3}
+          defaultViewport={{ x: 500, y: 280, zoom: 0.85 }}
+          panOnDrag={[0, 1]} // Left and middle mouse buttons
+          zoomOnScroll
+          zoomOnPinch
+          fitView={false}
+          style={{ background: 'transparent', position: 'absolute', inset: 0, zIndex: 1 }}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background
+            variant={BackgroundVariant.Dots}
+            gap={32}
+            size={1}
+            color="rgba(139,92,246,0.1)"
+            style={{ zIndex: 0 }}
+          />
 
-        <MiniMap
-          style={{
-            background: 'rgba(0,0,0,0.8)',
-            border: '1px solid rgba(139,92,246,0.3)',
-            borderRadius: '6px',
-          }}
-          nodeColor={node => {
-            if (node.id === 'kronos') return '#8b5cf6'
-            const agent = agents.find(a => a.id === node.id)
-            return agent ? statusColors[agent.status] : '#6b7280'
-          }}
-          maskColor="rgba(0,0,0,0.3)"
-          zoomable
-          pannable
-        />
+          {/* Custom edges overlay */}
+          <EdgesOverlay agents={agents} highlightedNode={highlightedNode} />
 
-        {/* CMD+K hint */}
-        <Panel position="top-right">
-          <button
-            onClick={() => setShowSearch(true)}
-            className="font-mono text-[10px] text-purple-400/60 hover:text-purple-400 transition-colors flex items-center gap-1.5 bg-black/40 border border-purple-500/20 rounded px-2 py-1"
-          >
-            <span>⌘K</span>
-            <span>search node</span>
-          </button>
-        </Panel>
+          <MiniMap
+            style={{
+              background: 'rgba(0,0,0,0.9)',
+              border: '1px solid rgba(139,92,246,0.3)',
+              borderRadius: '8px',
+            }}
+            nodeColor={node => {
+              if (node.id === 'kronos') return '#8b5cf6'
+              const agent = agents.find(a => a.id === node.id)
+              return agent ? statusColors[agent.status] : '#6b7280'
+            }}
+            maskColor="rgba(0,0,0,0.4)"
+            zoomable
+            pannable
+          />
 
-        {/* Zoom controls */}
-        <Panel position="bottom-right" style={{ marginBottom: 80 }}>
-          <div className="flex flex-col gap-1">
-            <button
-              onClick={() => zoomIn({ duration: 200 })}
-              className="w-7 h-7 font-mono text-sm text-purple-400 bg-black/60 border border-purple-500/20 rounded flex items-center justify-center hover:bg-purple-500/20 transition-colors"
-            >+</button>
-            <button
-              onClick={() => zoomOut({ duration: 200 })}
-              className="w-7 h-7 font-mono text-sm text-purple-400 bg-black/60 border border-purple-500/20 rounded flex items-center justify-center hover:bg-purple-500/20 transition-colors"
-            >−</button>
-            <button
-              onClick={() => fitView({ duration: 500, padding: 0.2 })}
-              className="w-7 h-7 font-mono text-[9px] text-purple-400 bg-black/60 border border-purple-500/20 rounded flex items-center justify-center hover:bg-purple-500/20 transition-colors"
-            >⊡</button>
-          </div>
-        </Panel>
-      </ReactFlow>
+          {/* Control panels */}
+          <Panel position="top-right">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowSearch(true)}
+                className="font-mono text-[10px] text-purple-400/60 hover:text-purple-400 transition-colors flex items-center gap-1.5 bg-black/60 border border-purple-500/20 rounded-lg px-3 py-1.5 backdrop-blur-sm"
+              >
+                <span className="text-purple-300">CMD+K</span>
+                <span className="text-gray-500">search</span>
+              </button>
+              <button
+                onClick={() => {
+                  setHyperspaceMode(true)
+                  setTimeout(() => {
+                    setHyperspaceMode(false)
+                    fitView({ duration: 800, padding: 0.3 })
+                  }, 2000)
+                }}
+                className="font-mono text-[10px] text-purple-400/60 hover:text-purple-400 transition-colors flex items-center gap-1.5 bg-black/60 border border-purple-500/20 rounded-lg px-3 py-1.5 backdrop-blur-sm"
+              >
+                <span className="text-purple-300">H</span>
+                <span className="text-gray-500">hyperspace</span>
+              </button>
+            </div>
+          </Panel>
+
+          {/* Zoom controls */}
+          <Panel position="bottom-right" style={{ marginBottom: 90 }}>
+            <div className="flex flex-col gap-1.5 bg-black/60 border border-purple-500/20 rounded-lg p-1 backdrop-blur-sm">
+              <button
+                onClick={() => zoomIn({ duration: 250 })}
+                className="w-8 h-8 font-mono text-sm text-purple-400 rounded-md flex items-center justify-center hover:bg-purple-500/20 transition-colors"
+              >+</button>
+              <div className="h-px bg-purple-500/20" />
+              <button
+                onClick={() => zoomOut({ duration: 250 })}
+                className="w-8 h-8 font-mono text-sm text-purple-400 rounded-md flex items-center justify-center hover:bg-purple-500/20 transition-colors"
+              >-</button>
+              <div className="h-px bg-purple-500/20" />
+              <button
+                onClick={() => fitView({ duration: 600, padding: 0.25 })}
+                className="w-8 h-8 font-mono text-[10px] text-purple-400 rounded-md flex items-center justify-center hover:bg-purple-500/20 transition-colors"
+              >FIT</button>
+            </div>
+          </Panel>
+
+          {/* Status legend */}
+          <Panel position="bottom-left">
+            <div className="flex items-center gap-3 bg-black/60 border border-purple-500/20 rounded-lg px-3 py-2 backdrop-blur-sm">
+              {Object.entries(statusLabels).map(([key, label]) => (
+                <div key={key} className="flex items-center gap-1.5">
+                  <div 
+                    className="w-2 h-2 rounded-full" 
+                    style={{ background: statusColors[key as AgentStatus], boxShadow: `0 0 6px ${statusColors[key as AgentStatus]}` }} 
+                  />
+                  <span className="font-mono text-[8px] text-gray-400 uppercase">{label.replace('...', '')}</span>
+                </div>
+              ))}
+            </div>
+          </Panel>
+        </ReactFlow>
+      </motion.div>
 
       {/* CMD+K Search modal */}
       <AnimatePresence>
         {showSearch && (
           <motion.div
-            className="absolute inset-0 z-50 flex items-start justify-center pt-16 px-8"
-            style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}
+            className="absolute inset-0 z-[100] flex items-start justify-center pt-20 px-8"
+            style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={() => setShowSearch(false)}
           >
             <motion.div
-              className="w-full max-w-md glass-panel rounded-lg overflow-hidden"
-              initial={{ y: -20, opacity: 0 }}
-              animate={{ y: 0, opacity: 1 }}
-              exit={{ y: -20, opacity: 0 }}
+              className="w-full max-w-lg glass-panel rounded-xl overflow-hidden shadow-2xl"
+              style={{ boxShadow: '0 0 50px rgba(139,92,246,0.3)' }}
+              initial={{ y: -30, opacity: 0, scale: 0.95 }}
+              animate={{ y: 0, opacity: 1, scale: 1 }}
+              exit={{ y: -30, opacity: 0, scale: 0.95 }}
               onClick={e => e.stopPropagation()}
             >
-              <input
-                autoFocus
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') handleSearch(searchQuery)
-                  if (e.key === 'Escape') setShowSearch(false)
-                }}
-                placeholder="Search node by name..."
-                className="w-full bg-transparent px-4 py-3 font-mono text-sm text-white placeholder-gray-600 outline-none border-b border-purple-500/20"
-              />
-              <div className="px-4 py-2">
+              <div className="flex items-center gap-3 px-4 py-3 border-b border-purple-500/20">
+                <div className="w-5 h-5 rounded-md bg-purple-500/20 flex items-center justify-center">
+                  <svg className="w-3 h-3 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                  </svg>
+                </div>
+                <input
+                  autoFocus
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') handleSearch(searchQuery)
+                    if (e.key === 'Escape') setShowSearch(false)
+                  }}
+                  placeholder="Search agents..."
+                  className="flex-1 bg-transparent font-mono text-sm text-white placeholder-gray-600 outline-none"
+                />
+                <span className="font-mono text-[10px] text-gray-600 px-1.5 py-0.5 rounded bg-gray-800">ESC</span>
+              </div>
+              <div className="max-h-64 overflow-y-auto p-2">
                 {agents
-                  .filter(a => a.name.toLowerCase().includes(searchQuery.toLowerCase()))
+                  .filter(a => a.name.toLowerCase().includes(searchQuery.toLowerCase()) || a.id.toLowerCase().includes(searchQuery.toLowerCase()))
                   .map(a => (
                     <button
                       key={a.id}
                       onClick={() => handleSearch(a.name)}
-                      className="w-full text-left font-mono text-xs text-gray-300 hover:text-white hover:bg-purple-500/10 px-2 py-1.5 rounded flex items-center gap-2 transition-colors"
+                      className="w-full text-left font-mono text-sm text-gray-300 hover:text-white hover:bg-purple-500/10 px-3 py-2 rounded-lg flex items-center gap-3 transition-colors"
                     >
-                      <span
-                        className="w-2 h-2 rounded-full shrink-0"
-                        style={{ background: statusColors[a.status] }}
+                      <motion.span
+                        className="w-2.5 h-2.5 rounded-full shrink-0"
+                        style={{ background: statusColors[a.status], boxShadow: `0 0 8px ${statusColors[a.status]}` }}
+                        animate={a.status !== 'idle' ? { scale: [1, 1.3, 1] } : {}}
+                        transition={{ duration: 1, repeat: Infinity }}
                       />
-                      {a.name}
-                      {a.device && <span className="text-gray-600 ml-auto">{a.device}</span>}
+                      <span className="flex-1">{a.name}</span>
+                      {a.device && <span className="text-gray-600 text-xs">{a.device}</span>}
+                      <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: statusBg[a.status], color: statusColors[a.status] }}>
+                        {statusLabels[a.status]}
+                      </span>
                     </button>
                   ))}
+                {agents.filter(a => a.name.toLowerCase().includes(searchQuery.toLowerCase())).length === 0 && (
+                  <p className="text-center text-gray-600 font-mono text-sm py-4">No agents found</p>
+                )}
               </div>
             </motion.div>
           </motion.div>
@@ -832,7 +1419,7 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
   )
 }
 
-// ─── Public export (wrapped with provider) ───────────────────────────────────
+// ─── Public export ─────────────────────────────────────��──────────────────────
 export function NodeMap({ agents, onNodeClick }: NodeMapProps) {
   return (
     <ReactFlowProvider>
