@@ -6,21 +6,16 @@ import {
   useRef,
   useState,
   useMemo,
-  memo,
 } from 'react'
 import {
   ReactFlow,
   Background,
   MiniMap,
   useNodesState,
-  useEdgesState,
-  addEdge,
   Handle,
   Position,
   type Node,
-  type Edge,
   type NodeProps,
-  type Connection,
   BackgroundVariant,
   useReactFlow,
   useNodes,
@@ -228,101 +223,6 @@ function ThreeBackground({ mouseX, mouseY }: { mouseX: number; mouseY: number })
       className="absolute inset-0 w-full h-full pointer-events-none"
       style={{ zIndex: 0 }}
     />
-  )
-}
-
-// ─── Animated bezier connection with flowing particles ────────────────────────
-function AnimatedEdge({
-  id, sourceX, sourceY, targetX, targetY, data,
-}: {
-  id: string
-  sourceX: number
-  sourceY: number
-  targetX: number
-  targetY: number
-  data?: { status?: AgentStatus; highlighted?: boolean }
-}) {
-  const status = data?.status ?? 'idle'
-  const highlighted = data?.highlighted ?? false
-  const color = status === 'executing' ? '#f59e0b' : highlighted ? '#a78bfa' : '#8b5cf6'
-  const glowOpacity = highlighted ? 0.8 : 0.4
-
-  // Cubic bezier control points
-  const dx = (targetX - sourceX) * 0.5
-  const d = `M${sourceX},${sourceY} C${sourceX + dx},${sourceY} ${targetX - dx},${targetY} ${targetX},${targetY}`
-
-  // Particle positions along the path (0..1)
-  const particleOffsets = useMemo(
-    () => [0, 0.25, 0.5, 0.75, 1].map((base, i) => ({ base, speed: 0.004 + i * 0.002 })),
-    []
-  )
-  const [particleTs, setParticleTs] = useState(particleOffsets.map(p => p.base))
-
-  useEffect(() => {
-    let frame: number
-    const tick = () => {
-      setParticleTs(prev =>
-        prev.map((t, i) => {
-          const next = t + particleOffsets[i].speed
-          return next > 1 ? next - 1 : next
-        })
-      )
-      frame = requestAnimationFrame(tick)
-    }
-    frame = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(frame)
-  }, [particleOffsets])
-
-  // Evaluate point on cubic bezier
-  const bezierPoint = (t: number) => {
-    const mt = 1 - t
-    const dx2 = (targetX - sourceX) * 0.5
-    const c1x = sourceX + dx2; const c1y = sourceY
-    const c2x = targetX - dx2; const c2y = targetY
-    return {
-      x: mt * mt * mt * sourceX + 3 * mt * mt * t * c1x + 3 * mt * t * t * c2x + t * t * t * targetX,
-      y: mt * mt * mt * sourceY + 3 * mt * mt * t * c1y + 3 * mt * t * t * c2y + t * t * t * targetY,
-    }
-  }
-
-  return (
-    <g>
-      {/* Outer glow */}
-      <path
-        d={d}
-        stroke={color}
-        strokeWidth={highlighted ? 8 : 5}
-        fill="none"
-        opacity={0.1 + glowOpacity * 0.15}
-        strokeLinecap="round"
-        style={{ filter: `blur(${highlighted ? 6 : 4}px)` }}
-      />
-      {/* Core line */}
-      <path
-        d={d}
-        stroke={color}
-        strokeWidth={highlighted ? 2 : 1.5}
-        fill="none"
-        opacity={glowOpacity}
-        strokeLinecap="round"
-        strokeDasharray={status === 'executing' ? '6 3' : 'none'}
-      />
-      {/* Flowing particles */}
-      {particleTs.slice(0, status === 'idle' ? 2 : 4).map((t, i) => {
-        const pt = bezierPoint(t)
-        return (
-          <circle
-            key={i}
-            cx={pt.x}
-            cy={pt.y}
-            r={status === 'executing' ? 2.5 : 1.8}
-            fill={color}
-            opacity={0.6 + Math.sin(t * Math.PI * 2) * 0.3}
-            style={{ filter: `drop-shadow(0 0 3px ${color})` }}
-          />
-        )
-      })}
-    </g>
   )
 }
 
@@ -710,21 +610,7 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
     return [kronosNode, ...agentNodes]
   }, [agents])
 
-  const initialEdges: Edge[] = useMemo(
-    () =>
-      agents.map(agent => ({
-        id: `e-kronos-${agent.id}`,
-        source: 'kronos',
-        target: agent.id,
-        type: 'animated',
-        data: { status: agent.status, highlighted: false },
-        animated: false,
-      })),
-    [agents]
-  )
-
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes)
-  const [edges, , onEdgesChange] = useEdgesState([])
 
   // Sync agent statuses into nodes
   useEffect(() => {
@@ -817,17 +703,13 @@ function NodeMapInner({ agents, onNodeClick }: NodeMapProps) {
       {/* ReactFlow */}
       <ReactFlow
         nodes={nodes}
-        edges={edges}
         onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
         onNodeClick={handleNodeClick}
         onNodeMouseEnter={handleNodeMouseEnter}
         onNodeMouseLeave={handleNodeMouseLeave}
         onPaneClick={() => setHighlightedNode(null)}
         onDoubleClick={onPaneDoubleClick}
         nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
         minZoom={0.2}
         maxZoom={3}
         defaultViewport={{ x: 420, y: 200, zoom: 0.85 }}
