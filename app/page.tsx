@@ -113,30 +113,31 @@ export default function PulseDashboard() {
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5 }}
           >
-            <div className="glass-panel rounded-lg p-4 relative overflow-hidden" style={{ minHeight: '340px' }}>
-              {/* Header */}
-              <div className="absolute top-4 left-4 z-10">
-                <h2 className="font-mono text-xs text-muted-foreground tracking-wider mb-1">
+            <div className="glass-panel rounded-lg relative overflow-hidden" style={{ height: '480px' }}>
+              {/* Header overlay */}
+              <div className="absolute top-3 left-4 z-20 pointer-events-none">
+                <h2 className="font-mono text-[10px] text-muted-foreground tracking-wider mb-0.5">
                   AI ORCHESTRATION
                 </h2>
-                <p className="font-mono text-lg font-bold gradient-text">
+                <p className="font-mono text-sm font-bold gradient-text leading-none">
                   NODE MATRIX
                 </p>
               </div>
               
               {/* Live indicator */}
-              <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
+              <div className="absolute top-3 right-4 z-20 flex items-center gap-2 pointer-events-none">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-status-pulse" />
-                <span className="font-mono text-[10px] text-emerald-400 tracking-wider">
-                  LIVE
-                </span>
+                <span className="font-mono text-[10px] text-emerald-400 tracking-wider">LIVE</span>
+                <span className="font-mono text-[9px] text-muted-foreground ml-2 hidden sm:inline">DBL-CLICK to fit • SCROLL to zoom • DRAG to pan</span>
               </div>
               
-              {/* Node Map */}
-              <NodeMap 
-                agents={agents} 
-                onNodeClick={handleNodeClick}
-              />
+              {/* Node Map — full bleed, no padding */}
+              <div className="absolute inset-0">
+                <NodeMap 
+                  agents={agents} 
+                  onNodeClick={handleNodeClick}
+                />
+              </div>
             </div>
           </motion.div>
           

@@ -214,6 +214,33 @@
     #0a0a0b;
 }
 
+/* ─── React Flow overrides ─────────────────────────────────── */
+.react-flow__renderer,
+.react-flow__viewport,
+.react-flow__pane {
+  cursor: none !important;
+}
+.react-flow__node {
+  cursor: none !important;
+}
+.react-flow__minimap-mask {
+  fill: rgba(0,0,0,0.3);
+}
+.react-flow__handle {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+.react-flow__edge-path {
+  stroke: none;
+}
+
+/* ─── Chromatic aberration on fast pan ─────────────────────── */
+@keyframes chroma {
+  0%, 100% { filter: none; }
+  10% { filter: drop-shadow(2px 0 0 rgba(139,92,246,0.25)) drop-shadow(-2px 0 0 rgba(16,185,129,0.15)); }
+  20% { filter: none; }
+}
+
 /* Hide scrollbar but keep functionality */
 .scrollbar-hide {
   -ms-overflow-style: none;
